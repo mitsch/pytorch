@@ -1,4 +1,4 @@
-FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu18.04 as build
+FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu18.04 as build-stack
 
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends \
@@ -24,6 +24,8 @@ RUN git clone https://github.com/catchorg/Catch2.git Catch2 && \
     cmake .. -DCATCH_BUILD_TESTING=OFF -DCATCH_INSTALL_DOCS=OFF && \
     cmake --build . && \
     cmake --install .
+
+FROM build-stack as build
 
 # LibTorch20
 WORKDIR /root/libtorch20
