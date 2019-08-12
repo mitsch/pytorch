@@ -2,6 +2,9 @@
 #define LIBTORCH__CPU_TENSOR__HEADER
 
 #include <vector>
+#include <cassert>
+#include <numeric>
+#include <tuple>
 
 namespace torch
 {
@@ -24,8 +27,8 @@ namespace torch
         CPUTensor (CPUTensor && tensor) = default;
 
         template <typename I>
-        requires CallableTo<I, T, std::vector<int> const&>
-             and MoveConstructible<T>
+        // requires CallableTo<I, T, std::vector<int> const&>
+        //      and MoveConstructible<T>
         CPUTensor (std::vector<int> lengths, I initialiser)
         {
             assert(lengths.size() > 0);
@@ -36,17 +39,38 @@ namespace torch
 
             auto const total_length = std::accumulate(
                 std::begin(lengths),
-                std::end(lengths),
+                std::end(lengths) ,
                 [](int count, int length){return count + length;});
-
             values.reserve(total_length);
-            auto indices = std::vector<int>{0, lengths.size()};
-
-            auto is_overflown = false;
-            while (not is_overflown)
+            
+            auto indices = std::vector<int>(0, lengths.size());
+            while (true)
             {
-                values.emplace_back(initialiser(indices));
-                std::tie(is_overflown, indices) = Increment(std::move(indices));
+                for (int index = 0; index < lengths.back(); ++index)
+                {
+                    indices.back() = index;
+                    values.emplace_back(initialiser(std::as_const(indices)));
+                }
+                auto iter_indices = indices.rbegin() + 1;
+                auto iter_lengths = lengths.rbegin() + 1;
+                while (iter_indices != indices.rend())
+                {
+                    ++*iter_indices;
+                    if (*iter_indices >= *iter_lengths)
+                    {
+                        *iter_indices = 0;
+                        ++iter_indices;
+                        ++iter_lengths;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                if (iter_indices == indices.rend())
+                {
+                    break;
+                }
             }
 
             this->lengths = std::move(lengths);
@@ -75,7 +99,7 @@ namespace torch
         /// Visits each element with the respective indices
         ///
         template <typename V>
-        requires Callable<V, T const&, std::vector<int> const&>
+        // requires Callable<V, T const&, std::vector<int> const&>
         void Visit (V visitor) const
         {
             std::vector<int> indices{0, lengths.size()};
@@ -89,7 +113,7 @@ namespace torch
         /// Maps a copy of each component into a new CPUTensor
         ///
         template <typename M>
-        requires Callable<M, T const&>
+        // requires Callable<M, T const&>
         auto Map (M mapper) const
         {
             using Mapped = std::result_of_t<M(T const&)>;
@@ -102,8 +126,22 @@ namespace torch
             return CPUTensor<Mapped>{lengths, std::move(mapped_values)};
         }
 
+        /// Maps a copy of each component with its index into a new CPUTensor
+        ///
+        template <typename M>
+        // requires Callable<M, T const&, std::vector<int> const&>
+        auto MapIndexed (M mapper) const
+        {
+            using Mapped = std::result_of_t<M(T const&, std::vector<int> const&)>;
+            std::vector<Mapped> mapped_values;
+            mapped_values.reserve(values.size());
+            // TODO efficiently iterate over the indices whilst iterating over
+            // the values ...
+            return CPUTensor<Mapped>{lengths, std::move(mapped_values)};
+        }
+
         template <typename M, typename ... Ts>
-        requires Callable<M, T const&, Ts const& ...>
+        // requires Callable<M, T const&, Ts const& ...>
         friend auto Map (M mapper,
                          CPUTensor const& that,
                          CPUTensor<Ts> const& ... those)
@@ -137,7 +175,8 @@ namespace torch
         /// dimensions, the components will be mapped onto a single value which
         /// ...
         ///
-        template <CallableTo<T, T, T> S>
+        template <typename S>
+        // requires CallableTo<S, T, T, T>
         auto Scan (int dimensions, bool keep_dimensions, S scanner) const
         {
             assert(dimensions <= lengths.size());
@@ -197,7 +236,8 @@ namespace torch
             return CPUTensor{std::move(new_lengths), std::move(new_values)};
         }
 
-        template <CallableTo<T, T, T> S>
+        template <typename S>
+        // requires CallableTo<S, T, T, T>
         auto Scan (std::vector<bool> dimensions, bool keep_dimensions, S scanner)
         const
         {
@@ -275,7 +315,7 @@ namespace torch
         ///
         /// @pre dimensions <= tensor.Lengths().size()
         template <typename O>
-        requires Callable<O, std::vector<int> const&, std::vector<T>::iterator, std::vector<T>::iterator>
+        // requires Callable<O, std::vector<int> const&, std::vector<T>::iterator, std::vector<T>::iterator>
         auto Reorder (int dimensions, O order) const
         {
             assert(dimensions >= lengths.size());
@@ -485,7 +525,7 @@ namespace torch
         /// @pre dimensions.size() == Lengths().size()
         ///
         template <typename R>
-        requires CallableTo<R, T, std::vector<int> const&, std::vector<T>::iterator, std::vector<T>::iterator>
+        // requires CallableTo<R, T, std::vector<int> const&, std::vector<T>::iterator, std::vector<T>::iterator>
         auto Reduce (std::vector<bool> const& dimensions,
                      bool const keep_dimensions,
                      R reducer)
@@ -663,6 +703,12 @@ namespace torch
         }
 #endif
 
+        /// Computes the offset to the indexed value
+        ///
+        /// @pre indices.size() == lengths.size()
+        /// @pre for i in indices: i >= 0
+        /// @pre for (i,l) in (indices, lengths): i < l
+        /// 
         int Offset (std::vector<int> const& indices) const
         {
             assert(indices.size() == lengths.size());
@@ -687,6 +733,7 @@ namespace torch
 
     };
 
+#if 0
     // -------------------------------------------------------------------------
     // Matrix Algebra
     // -------------------------------------------------------------------------
@@ -861,6 +908,7 @@ namespace torch
             std::partition(begin, end, predictor);
         });
     }
+#endif
 
 }
 

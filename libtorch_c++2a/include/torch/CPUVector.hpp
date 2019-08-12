@@ -1,15 +1,17 @@
-d#ifndef LIBTORCH__TEN__CPU_TENSOR__HEADER
-#define LIBTORCH__TEN__CPU_TENSOR__HEADER
+#ifndef LIBTORCH__CPU_VECTOR__HEADER
+#define LIBTORCH__CPU_VECTOR__HEADER
 
 #include <vector>
 
-namespace torch::ten
+namespace torch
 {
 
     template <typename V>
-    class CPUTensor
+    class CPUVector
     {
     public:
+
+        CPUVector () = default;
 
         template <typename I>
             requires CallableTo<I, V, std::vector<int> const&>
@@ -44,14 +46,6 @@ namespace torch::ten
             this->strides[0] = 0;
         }
 
-        CPUTensor (std::vector<V> values, std::vector<int> lengths)
-        {
-            
-        }
-
-        CPUTensor (std::vector<V> values, std::vector<int> lengths, std::vector<int> strides)
-        {}
-
         int Rank () const
         {
             return lengths.size();
@@ -70,11 +64,11 @@ namespace torch::ten
             assert(lengths.size() == strides.size());
         }
 
-        template <typename M>
+        template <typename M, typename ... Ts>
             requires Callable<M, V const&>
-        auto Map (M mapper) const
+        auto Map (M mapper, CPUTensor<Ts> const& ... others) const
         {
-            using Mapped = std::result_of_t<M(V const&)>;
+            using Mapped = std::result_of_t<M(V const&, Ts const& ...)>;
             std::vector<Mapped> mapped_values;
             mapped_values.reserve(values.size());
             for (auto const& value : values)
@@ -87,25 +81,11 @@ namespace torch::ten
                 strides};
         }
 
-        template <typename M>
-            requires Callable<M, V const&, std::vector<int> const&>
-        auto Map (M mapper) const
+
+        template <typename P>
+        auto Project (std::vector<int> dimensions, P projector) const
         {
-            using Mapped = std::result_of_t<M(V const&)>;
-            std::vector<Mapped> mapped_values;
-            mapped_values.reserve(values.size());
-            auto indices = std::vector<int>(lengths.size(), 0);
-            for (auto const& value : values)
-            {
-                mapped_values.emplace_back(mapper(value, indices));
-                auto [overflow, incremented] = Increment(std::move(indices));
-                (void)overflow;
-                indices = std::move(incremented);
-            }
-            return CPUTensor<Mapped>{
-                std::move(mapped_values),
-                lengths,
-                strides};
+            std::vector<
         }
 
 
@@ -137,37 +117,9 @@ namespace torch::ten
     };
 
 
-    template <typename V>
-    int Rank (CPUTensor<V> const& tensor)
-    {
-        return tensor.Rank();
-    }
 
-    template <typename V>
-    int Length (CPUTensor<V> const& tensor, int index)
-    {
-        return tensor.Length(index);
-    }
 
-    template <typename V>
-    V const& At (CPUTensor<V> const& tensor, std::vector<int> const& indices)
-    {
-        return tensor.At(indices);
-    }
 
-    template <typename V, typename M>
-        requires Callable<M, V const&>
-    auto Map (CPUTensor<V> const& tensor, M mapper)
-    {
-        return tensor.Map(std::move(mapper));
-    }
-
-    template <typename V, typename M>
-        requires Callable<M, V const&, std::vector<int> const&>
-    auto Map (CPUTensor<V> const& tensor, M mapper)
-    {
-        return tensor.Map(std::move(mapper));
-    }
 
 }
 
