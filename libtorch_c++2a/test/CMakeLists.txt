@@ -2,6 +2,7 @@
 find_package(Catch2 CONFIG REQUIRED)
 
 add_executable(test_libtorch20 CPUTensor.cpp)
+target_compile_options(test_libtorch20 PUBLIC -fconcepts -std=c++2a -fmax-errors=5)
 
 target_include_directories(
   test_libtorch20 PUBLIC

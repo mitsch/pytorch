@@ -5,6 +5,9 @@
 #include <cassert>
 #include <numeric>
 #include <tuple>
+#include <algorithm>
+
+#include <torch/Concepts.hpp>
 
 namespace torch
 {
@@ -13,6 +16,20 @@ namespace torch
     class CPUTensor
     {
     public:
+
+        struct PrefixDimensions
+        {
+            int count;
+            PrefixDimensions () = delete;
+            PrefixDimensions (int count) : count{count} {}
+        };
+
+        struct SuffixDimensions
+        {
+            int count;
+            SuffixDimensions () = delete;
+            SuffixDimensions (int count) : count{count} {}
+        };
 
         /// Constructs an empty tensor
         ///
@@ -26,9 +43,14 @@ namespace torch
         ///
         CPUTensor (CPUTensor && tensor) = default;
 
+        /// Constructs by direct initialisation
+        ///
+        /// A tensor of dimensional \a lengths will be created which
+        /// subsequently will be directly initialised by \a initialiser.
+        ///
         template <typename I>
-        // requires CallableTo<I, T, std::vector<int> const&>
-        //      and MoveConstructible<T>
+        requires CallableTo<I, T, std::vector<int> const&>
+             and MoveConstructible<T>
         CPUTensor (std::vector<int> lengths, I initialiser)
         {
             assert(lengths.size() > 0);
@@ -37,17 +59,13 @@ namespace torch
                 assert(length > 0);
             }
 
-            auto const total_length = std::accumulate(
-                std::begin(lengths),
-                std::end(lengths) ,
-                [](int count, int length){return count + length;});
-            values.reserve(total_length);
+            values.reserve(Product(lengths));
             
             auto indices = std::vector<int>(0, lengths.size());
             while (true)
             {
                 for (int index = 0; index < lengths.back(); ++index)
-                {
+                { 
                     indices.back() = index;
                     values.emplace_back(initialiser(std::as_const(indices)));
                 }
@@ -76,7 +94,9 @@ namespace torch
             this->lengths = std::move(lengths);
             this->strides.resize(this->lengths.size());
             std::partial_sum(std::begin(this->lengths), std::end(this->lengths), std::begin(this->strides));
-            std::shift_right(std::begin(this->strides), std::end(this->strides), 1);
+            std::move_backward(std::begin(this->strides),
+                               std::end(this->strides) - 1,
+                               std::end(this->strides));
             this->strides[0] = 0;
         }
 
@@ -87,6 +107,7 @@ namespace torch
             return lengths;
         }
 
+#if 0
         /// Single component on host at \a indices
         ///
         T const& At (std::vector<int> const& indices) const
@@ -95,18 +116,31 @@ namespace torch
             auto const offset = Offset(indices);
             return values[offset];
         }
+#endif
 
         /// Visits each element with the respective indices
         ///
         template <typename V>
-        // requires Callable<V, T const&, std::vector<int> const&>
+        requires Callable<V, T const&, std::vector<int> const&>
         void Visit (V visitor) const
         {
             std::vector<int> indices{0, lengths.size()};
             for (auto const& value : values)
             {
                 visitor(value, indices);
-                Increment(indices);
+                auto iter_indices = indices.rbegin();
+                auto iter_lengths = lengths.rbegin();
+                while (iter_indices != indices.rend())
+                {
+                    ++*iter_indices;
+                    if (*iter_indices < *iter_lengths)
+                    {
+                        break;
+                    }
+                    *iter_indices = 0;
+                    ++iter_indices;
+                    ++iter_lengths;
+                }
             }
         }
 
@@ -126,6 +160,7 @@ namespace torch
             return CPUTensor<Mapped>{lengths, std::move(mapped_values)};
         }
 
+#if 0
         /// Maps a copy of each component with its index into a new CPUTensor
         ///
         template <typename M>
@@ -163,6 +198,7 @@ namespace torch
             }
             return CPUTensor<Mapped>{lengths, std::move(mapped_values)};
         }
+#endif
 
         /// Scans along the last \a dimensions
         ///
@@ -175,39 +211,31 @@ namespace torch
         /// dimensions, the components will be mapped onto a single value which
         /// ...
         ///
-        template <typename S>
-        // requires CallableTo<S, T, T, T>
-        auto Scan (int dimensions, bool keep_dimensions, S scanner) const
+        template <typename D, typename S>
+        auto Scan (D dimensions, bool keep_dimensions, S scanner)
+        const
         {
-            assert(dimensions <= lengths.size());
-            assert(dimensions >= -lengths.size());
-
-            if (dimensions < 0)
+            if constexpr (std::is_same_v<D, PrefixDimensions>)
             {
-                dimensions += lengths.size();
+                assert(dimensions.count >= -lengths.size());
+                assert(dimensions.count <= lengths.size());
+            }
+            else if constexpr (std::is_same_v<D, SuffixDimensions>)
+            {
+                assert(dimensions.count >= -lengths.size());
+                assert(dimensions.count <= lengths.size());
+            }
+            else if constexpr (std::is_same_v<D, std::vector<bool>>)
+            {
+                assert(dimensions.size() == lengths.size());
             }
 
-            auto new_lengths = std::vector<int>{};
-            new_lengths.reserve(keep_dimensions ? lengths.size() : dimensions);
-            new_lengths.insert(
-                new_lengths.end(),
-                lengths.begin(),
-                lengths.begin() + dimensions);
-            if (keep_dimensions)
-            {
-                new_lengths.resize(lengths.size(), 1);
-            }
-
-            auto const new_total_length = std::accumulate(
-                new_lengths.begin(),
-                new_lengths.end(),
-                1,
-                std::multiplies<int>{});
-
+            auto new_lengths = NewLengths(dimensions, keep_dimensions, 0);
             auto new_values = std::vector<T>{};
-            new_values.reserve(new_total_length);
+            new_values.reserve(Product(new_lengths));
 
-            FoldChunks(
+            // TODO assumes linear traversal!!!
+            FoldAdjacents(
                 dimensions,
                 [&](auto const& indices, auto begin, auto const end)
                 {
@@ -236,67 +264,6 @@ namespace torch
             return CPUTensor{std::move(new_lengths), std::move(new_values)};
         }
 
-        template <typename S>
-        // requires CallableTo<S, T, T, T>
-        auto Scan (std::vector<bool> dimensions, bool keep_dimensions, S scanner)
-        const
-        {
-            assert(dimensions.size() == lengths.size());
-
-            auto new_lengths = std::vector<int>{};
-            new_lengths.reserve(keep_dimensions ? lengths.size() : std::count(
-                dimensions.begin(),
-                dimensions.end(),
-                false));
-            for (int alpha = 0; alpha < dimensions.size(); ++alpha)
-            {
-                if (not dimensions[alpha])
-                {
-                    new_lengths.push_back(lengths[alpha]);
-                }
-                else if (keep_dimensions)
-                {
-                    new_lengths.push_back(1);
-                }
-            }
-
-            auto const new_total_length = std::accumulate(
-                new_lengths.begin(),
-                new_lengths.end(),
-                1,
-                std::multiplies<int>{});
-
-            auto new_values = std::vector<T>{};
-            new_values.reserve(new_total_length);
-
-            FoldChunks(
-                dimensions,
-                [&](auto const& indices, auto begin, auto const end)
-                {
-                    assert(std::distance(begin, end) > 0);
-                    auto init = *begin++;
-                    return std::accumulate(
-                        begin,
-                        end,
-                        std::move(init),
-                        scanner);
-                },
-                [&](auto init, auto const begin, auto const end)
-                {
-                    return std::accumulate(
-                        begin,
-                        end,
-                        std::move(init),
-                        scanner);
-                },
-                [&](auto scanned)
-                {
-                    new_values.push_back(std::move(scanned));
-                });
-
-            return CPUTensor{std::move(new_lengths), std::move(new_values)};
-        }
-
         /// Reorders a copy of components along the last \a dimensions into a
         /// single dimension
         ///
@@ -314,34 +281,36 @@ namespace torch
         /// @pre dimensions >= tensor.Lengths().size()
         ///
         /// @pre dimensions <= tensor.Lengths().size()
-        template <typename O>
+        template <typename D, typename O>
         // requires Callable<O, std::vector<int> const&, std::vector<T>::iterator, std::vector<T>::iterator>
-        auto Reorder (int dimensions, O order) const
+        auto Reorder (D dimensions, bool keep_dimensions, O order) const
         {
-            assert(dimensions >= lengths.size());
-            assert(dimensions <= lengths.size());
-
-            if (dimensions < 0)
+            if constexpr (std::is_same_v<D, PrefixDimensions>)
             {
-                dimensions += lengths.size();
+                assert(dimensions.count >= -lengths.size());
+                assert(dimensions.count <= lengths.size());
+            }
+            else if constexpr (std::is_same_v<D, SuffixDimensions>)
+            {
+                assert(dimensions.count >= -lengths.size());
+                assert(dimensions.count <= lengths.size());
+            }
+            else if constexpr (std::is_same_v<D, std::vector<bool>>)
+            {
+                assert(dimensions.size() == lengths.size());
+            }
+            else
+            {
+                assert(false);
             }
 
-            auto new_lengths = std::vector<int>{};
-            new_lengths.reserve(dimensions + 1);
-            new_lengths.insert(
-                new_lengths.end(),
-                lengths.begin(),
-                lengths.begin() + dimensions);
-            new_lengths.push_back(std::accumulate(
-                lengths.begin() + dimensions,
-                lengths.end(),
-                1,
-                std::multiplies<int>{}));
-
+            auto new_lengths = NewLengths(dimensions, keep_dimensions, -1);
+            assert(Product(new_lengths) == values.size());
             auto new_values = std::vector<T>{};
             new_values.reserve(values.size());
 
-            FoldChunks(
+            // TODO assumes linear traversal; must be generalised
+            FoldAdjacents(
                 dimensions,
                 [&](auto const&, auto const begin, auto const end)
                 {
@@ -363,79 +332,8 @@ namespace torch
             return CPUTensor{std::move(new_lengths), std::move(new_values)};
         }
 
-        /// Reorders a copy of components along all true \a dimensions into a
-        /// single dimension
-        ///
-        /// @detail
-        /// A tensor will be returned. The returning tensor will have identical
-        /// dimensional lengths except for all true \a dimensions which will be
-        /// replaced by one dimension with a length equivalent to the length of
-        /// those true \a dimensions. The components will be rerordered
-        /// separatelly for each configuration in the false \a dimensions.
-        ///
-        /// @param dimensions
-        /// Boolean mapping for each dimension to be included in the reordering
-        /// (true value) or excluded (false value).
-        ///
-        /// @param order
-        /// TODO description
-        ///
-        /// @pre dimensions.size() == Lengths().size()
-        ///
-        template <typename O>
-        auto Reorder (std::vector<bool> dimensions, O order) const
-        {
-            assert(dimensions.size() == lengths.size());
 
-            auto new_lengths = std::vector<int>{};
-            new_lengths.reserve(1 + std::count(
-                dimensions.begin(),
-                dimensions.end(),
-                false));
-            for (int alpha = 0; alpha < dimensions.size(); ++alpha)
-            {
-                if (not dimensions[alpha])
-                {
-                    new_lengths.push_back(lengths[alpha]);
-                }
-            }
-            new_lengths.push_back(values.size() / std::accumulate(
-                new_lengths.begin(),
-                new_lengths.end(),
-                1,
-                std::multiplies<int>{}));
-
-            assert(values.size() == std::accumulate(
-                new_values.begin(),
-                new_values.end(),
-                1,
-                std::multiplies<int>{}));
-
-            auto new_values = std::vector<T>{};
-            new_values.reserve(values.size());
-
-            FoldChunks(
-                dimensions,
-                [&](auto const&, auto const begin, auto const end)
-                {
-                    new_values.insert(new_values.end(), begin, end);
-                    return nullptr;
-                },
-                [&](auto const, auto const begin, auto const end)
-                {
-                    new_values.insert(new_values.end(), begin, end);
-                    return nullptr;
-                },
-                [&](auto const)
-                {
-                    auto const begin = new_values.end() - new_lengths.back();
-                    auto const end = new_values.end();
-                    order(begin, end);
-                });
-
-            return CPUTensor{std::move(new_lengths), std::move(new_values)};
-        }
-
+#if 0
         /// Folds along the last \a dimensions
         ///
         /// @pre dimensions <= Lengths().size()
@@ -454,113 +352,48 @@ namespace torch
 
 
         }
+#endif
 
-        /// Reduces the last \a dimensions to one value
+        /// Reduces \a dimensions to one value
         ///
-        /// All values along the true \a dimensions will be reduced to one value
-        /// for each configuration of the remaining dimensions.
-        ///
-        /// @pre dimensions <= Lengths().size()
-        /// @pre dimensions >= -Lengths().size()
+        /// All values along the \a dimensions will be reduced to one value for
+        /// each configuration of the remaining dimensions.
         ///
         ///
-        template <typename R>
-        auto Reduce (int dimensions, bool keep_dimensions, R reducer) const
+        template <typename D, typename R>
+        requires std::is_same_v<D, SuffixDimensions> or std::is_same_v<D, PrefixDimensions> or std::is_same_v<D, std::vector<bool>>
+        auto Reduce (D dimensions, bool keep_dimensions, R reducer) const
         {
-            assert(dimensions >= -lengths.size());
-            assert(dimensions <= lengths.size());
-
-            if (dimensions < 0)
+            if constexpr (std::is_same_v<D, PrefixDimensions>)
             {
-                dimensions += lengths.size();
+                assert(dimensions.count >= -lengths.size());
+                assert(dimensions.count <= lengths.size());               
+            }
+            else if constexpr (std::is_same_v<D, SuffixDimensions>)
+            {
+                assert(dimensions.count >= -lengths.size());
+                assert(dimensions.count <= lengths.size());
+            }
+            else if constexpr (std::is_same_v<D, std::vector<bool>>)
+            {
+                assert(dimensions.size() == lengths.size());
+            }
+            else
+            {
+                assert(false);
             }
 
-            std::vector<int> new_lengths;
-            new_lengths.reserve(keep_dimensions ? lengths.size() : dimensions);
-            new_lengths.insert(
-                new_lengths.end(),
-                lengths.begin(),
-                lengths.begin() + dimensions);
-            if (keep_dimensions)
-            {
-                new_lengths.resize(lengths.size(), 1);
-            }
-
-            auto const new_total_length = std::accumulate(
-                new_lengths.begin(),
-                new_lengths.end(),
-                1,
-                std::multiplies<int>{});
+            auto new_lengths = NewLengths(dimensions, keep_dimensions, 0);
 
             std::vector<T> new_values;
-            new_values.reserve(new_total_length);
+            new_values.reserve(Product(new_lengths));
 
-            FoldChunks(
+            FoldAdjacents(
                 dimensions,
-                [](auto const& indices, auto const begin, auto const end)
+                [&](auto const& indices, auto const begin, auto const end)
                 {
                     auto chunk = std::vector<T>{};
-                    chunk.reserve(values.size() / new_total_length);
-                    chunk.insert(chunk.end(), begin, end);
-                    return std::move(chunk);
-                },
-                [](auto chunk, auto const begin, auto const end)
-                {
-                    chunk.insert(chunk.end(), begin, end);
-                    return std::move(chunk);
-                },
-                [&](auto chunk)
-                {
-                    new_values.push_back(reducer(chunk.begin(), chunk.end()));
-                });
-
-            return CPUTensor{std::move(new_lengths), std::move(new_values)};
-        }
-
-        /// Reduces to one component over arbitrary \a dimensions
-        ///
-        /// All values along the true \a dimensions will be reduced to one value
-        /// for each configuration of false \a dimensions.
-        ///
-        /// @pre dimensions.size() == Lengths().size()
-        ///
-        template <typename R>
-        // requires CallableTo<R, T, std::vector<int> const&, std::vector<T>::iterator, std::vector<T>::iterator>
-        auto Reduce (std::vector<bool> const& dimensions,
-                     bool const keep_dimensions,
-                     R reducer)
-        const
-        {
-            assert(dimensions.size() == lengths.size());
-
-            std::vector<int> new_lengths;
-            new_lengths.reserve(keep_dimensions
-                ? lengths.size()
-                : std::count(dimensions.begin(), dimensions.end(), false));
-
-            for (int alpha = 0; alpha < dimensions.size(); ++alpha)
-            {
-                if (not dimensions[alpha])
-                    new_lengths.push_back(lengths[alpha]);
-                else if (keep_dimensions)
-                    new_lengths.push_back(1);
-            }
-
-            auto const new_total_length = std::accumulate(
-                new_lengths.begin(),
-                new_lengths,
-                1,
-                std::multiplies<int>{});
-
-            std::vector<T> new_values;
-            new_values.reserve(new_total_length);
-
-            FoldChunks(
-                dimensions,
-                [](auto const& indices, auto const begin, auto const end)
-                {
-                    auto chunk = std::vector<T>{};
-                    chunk.reserve(values.size() / new_total_length);
+                    chunk.reserve(values.size() / new_values.size());
                     chunk.insert(chunk.end(), begin, end);
                     return std::move(chunk);
                 },
@@ -579,21 +412,241 @@ namespace torch
 
     private:
 
-        template <typename C, typename F, typename D>
-        void FoldChunks (std::vector<bool> const& dimensions, C constructor, F folder, D destructor)
+        template <typename C>
+        static auto Product (C const& container)
+        {
+            return std::accumulate(
+                std::begin(container),
+                std::end(container),
+                1,
+                std::multiplies<>{});
+        }
+
+        std::vector<int> NewLengths (SuffixDimensions dimensions, bool keep_dimensions, int postfix)
+        {
+            assert(dimensions.count >= -lengths.size());
+            assert(dimensions.count <= lengths.size());
+            assert(postfix >= 0);
+
+            if (dimensions.count < 0)
+            {
+                dimensions.count += lengths.size();
+            } 
+            auto const new_rank = keep_dimensions
+                                   ? lengths.size()
+                                   : dimensions.count + (postfix == 0 ? 0 : 1);
+            std::vector<int> new_lengths;
+            new_lengths.reserve(new_rank);
+            new_lengths.insert(
+                new_lengths.end(),
+                lengths.begin(),
+                lengths.begin() + dimensions.count);
+            if (keep_dimensions)
+            {
+                new_lengths.resize(lengths.size(), 1);
+            }
+            if (postfix != 0)
+            {
+                new_lengths.push_back(postfix);
+            }
+            return new_lengths;
+        }
+
+        std::vector<int> NewLengths (PrefixDimensions dimensions,
+                                     bool keep_dimensions,
+                                     int postfix)
+        {
+            assert(dimensions.count >= - lengths.size());
+            assert(dimensions.count <= lengths.size());
+            assert(postfix >= 0);
+
+            if (dimensions.count < 0)
+            {
+                dimensions.count += lengths.size();
+            } 
+            auto const new_rank = keep_dimensions
+                ? lengths.size()
+                : (lengths.size() - dimensions.count + (postfix == 0 ? 0 : 1));
+            std::vector<int> new_lengths;
+            new_lengths.reserve(new_rank);
+            if (keep_dimensions)
+            {
+                new_lengths.resize(dimensions.count, 1);
+            }
+            new_lengths.insert(
+                new_lengths.end(),
+                lengths.begin() + dimensions.count,
+                lengths.end());
+            if (postfix != 0)
+            {
+                new_lengths.push_back(postfix);
+            }
+            return new_lengths;
+        }
+
+        std::vector<int> NewLengths (std::vector<bool> dimensions,
+                                     bool keep_dimensions,
+                                     int postfix)
+        {
+            assert(dimensions.size() == lengths.size());
+            assert(postfix >= 0);
+            
+            auto const new_rank = keep_dimensions
+                ? lengths.size()
+                : std::count(dimensions.begin(), dimensions.end(), false);
+            std::vector<int> new_lengths;
+            new_lengths.reserve(new_rank + (postfix == 0 ? 0 : 1));
+            for (int alpha = 0; alpha < lengths.size(); ++alpha)
+            {
+                if (dimensions[alpha])
+                    new_lengths.push_back(lengths[alpha]);
+                else if (keep_dimensions)
+                    new_lengths.push_back(1);
+            }
+            if (postfix != 0)
+            {
+                new_lengths.push_back(postfix);
+            }
+            return new_lengths;
+        }
+
+        /// Folds chunks of adjacent elements for projecting the last \a
+        /// dimensions
+        ///
+        /// For each configuration, all chunks of adjacent elements for
+        /// projecting the last \a dimensions will be folded by \a head_folder
+        /// (the first fold) and \a tail_folder (the subsequent folds). The
+        /// final fold will be passed to \a finisher.
+        /// 
+        template <typename H, typename U, typename F>
+        void FoldAdjacents (SuffixDimensions dimensions,
+                            H head_folder,
+                            U tail_folder,
+                            F finisher) const
+        {
+            assert(dimensions.count >= -lengths.size());
+            assert(dimensions.count <= lengths.size());
+
+            if (dimensions.count < 0)
+            {
+                dimensions.count += lengths.size();
+            }
+
+            auto const chunk_size = std::accumulate(
+                lengths.rbegin(),
+                lengths.rbegin() + dimensions.count,
+                1,
+                std::multiplies<int>{});
+
+            auto indices = std::vector<int>{lengths.size(), 0};
+            auto begin = values.begin();
+            while (begin != values.end())
+            {
+                auto const end = begin + chunk_size;
+                finisher(head_folder(
+                    std::as_const(indices),
+                    std::as_const(begin),
+                    end));
+                begin = end;
+                auto iter_indices = indices.rbegin() + dimensions.count;
+                auto iter_lengths = lengths.rbegin() + dimensions.count;
+                while (iter_indices != indices.rend())
+                {
+                    ++*iter_indices;
+                    if (*iter_indices < *iter_lengths)
+                    {
+                        break;
+                    }
+                    *iter_indices = 0;
+                    ++iter_indices;
+                    ++iter_lengths;
+                }
+                assert(iter_indices != indices.rend() or begin == values.end());
+            }
+        }
+
+        /// Folds chunks of adjacent elements for projecting the first \a
+        /// dimensions
+        ///
+        /// For each configuration, all chunks of adjacent elements for
+        /// projecting the first \a dimensions will be folded by \a head_folder
+        /// (the first fold) and \a tail_folder (the subsequent folds). The
+        /// final fold will be passed to \a finisher.
+        /// 
+        template <typename H, typename U, typename F>
+        void FoldAdjacents (PrefixDimensions dimensions,
+                            H head_folder,
+                            U tail_folder,
+                            F finisher) const
+        {
+            assert(dimensions.count >= -lengths.size());
+            assert(dimensions.count <= lengths.size());
+
+            if (dimensions.count < 0)
+            {
+                dimensions.count += lengths.size();
+            }
+
+            auto const stride = std::accumulate(
+                lengths.rbegin(),
+                lengths.rbegin() + dimensions.count,
+                1,
+                std::multiplies<int>{});
+            assert(values.size() % stride == 0);
+
+            auto const counts = values.size() / stride;
+
+            auto indices = std::vector<int>{lengths.size(), 0};
+            for (int alpha = 0; alpha < stride; ++alpha)
+            {
+                auto const head_begin = values.begin() + alpha;
+                auto const head_end = head_begin + 1;
+                auto folded = head_folder(
+                    std::as_const(indices),
+                    head_begin,
+                    head_end);
+                for (int beta = 1; beta < counts; ++beta)
+                {
+                    auto const begin = values.begin() + alpha + beta * stride;
+                    auto const end = begin + 1;
+                    folded = tail_folder(std::move(folded), begin, end);
+                }
+                finisher(std::move(folded));
+                auto iter_indices = indices.rbegin();
+                auto iter_lengths = lengths.rbegin();
+                while (iter_indices != indices.rbegin() + dimensions.count)
+                {
+                    ++*iter_indices;
+                    if (*iter_indices < *iter_lengths)
+                    {
+                        break;
+                    }
+                    *iter_indices = 0;
+                    ++iter_indices;
+                    ++iter_lengths;
+                }
+            }
+        }
+
+        /// 
+        template <typename H, typename U, typename F>
+        void FoldAdjacents (std::vector<bool> const& dimensions,
+                            H head_folder,
+                            U tail_folder,
+                            F finisher)
         const
         {
             assert(dimensions.size() == lengths.size());
 
-            auto const chunk_dimensions = std::distance(
+            auto const chunk_count = std::distance(
                 dimensions.rbegin(),
                 std::find(dimensions.rbegin(), dimensions.rend(), false));
 
-            auto const free_dimensions = dimensions.size() - chunk_dimensions;
+            auto const free_count = dimensions.size() - chunk_count;
 
             auto const chunk_length = std::accumulate(
                 lengths.rbegin(),
-                lengths.rbegin() + chunk_dimensions,
+                lengths.rbegin() + chunk_count,
                 1,
                 std::multiplies<int>{});
 
@@ -601,13 +654,15 @@ namespace torch
 
             while (true)
             {
+                // TODO offset is not well defined
+                auto const offset = 0;
                 /* Inner loop ... */
-                auto folding = constructor(
+                auto folded = head_folder(
                     std::as_const(indices),
                     values.begin() + offset,
                     values.begin() + offset + chunk_length);
 
-                for (auto inner_index = free_dimensions; inner_index > 0;)
+                for (auto inner_index = free_count; inner_index > 0;)
                 {
                     --inner_index;
                     if (not dimensions[inner_index])
@@ -619,14 +674,15 @@ namespace torch
                         continue;
                     }
 
-                    auto const begin = /*  ... */;
-                    auto const end = /* ... */;
+                    // TODO begin and end are not well defined
+                    auto const begin = values.begin();
+                    auto const end = begin + offset;
                     folding = folder(std::move(folding), begin, end);
                     inner_index = free_dimensions;
                 }
-                destructor(std::move(folding));
+                finisher(std::move(folded));
 
-                auto outer_index = free_dimensions;
+                auto outer_index = free_count;
                 while (outer_index > 0)
                 {
                     --outer_index;
@@ -642,12 +698,6 @@ namespace torch
                 if (outer_index == 0)
                     break;
             }
-        }
-
-        template <typename C, typename F, typename D>
-        void FoldChunks (int dimensions, C constructor, F folder, D destructor)
-        const
-        {
         }
 
 #if 0
